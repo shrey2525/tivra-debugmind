@@ -2,7 +2,7 @@
   "name": "tivra-debugmind",
   "displayName": "Tivra DebugMind",
   "description": "AI debugging copilot for production services. Automatically fetches logs, analyzes errors, performs RCA, and suggests fixes.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "shreychaturvedi",
   "license": "MIT",
   "icon": "media/logo.png",

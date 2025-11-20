@@ -3,7 +3,6 @@
 **Paste logs → Get RCA → Apply fixes.**  
 No setup required. No cloud connection needed.
 
-![Tivra DebugMind Demo](https://jumpshare.com/s/zRLj8obcA3IjIzxVKjbA)
 
 DebugMind explains errors, finds root causes, and generates code fixes - right inside VS Code.
 
