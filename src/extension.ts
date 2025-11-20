@@ -153,13 +153,10 @@ async function connectToAWS() {
 
 function showWelcomeMessage(context: vscode.ExtensionContext) {
   vscode.window.showInformationMessage(
-    '🤖 Welcome to Tivra DebugMind! Your AI debugging assistant for AWS.',
-    'Connect to AWS',
-    'Open Copilot'
+    '🤖 Welcome to Tivra DebugMind! Your AI debugging assistant.',
+    'Start Debugging'
   ).then(choice => {
-    if (choice === 'Connect to AWS') {
-      vscode.commands.executeCommand('tivra.connectAWS');
-    } else if (choice === 'Open Copilot') {
+    if (choice === 'Start Debugging') {
       copilot = DebugCopilot.createOrShow(context.extensionUri, context, apiUrl, credentialManager, analytics);
     }
   });

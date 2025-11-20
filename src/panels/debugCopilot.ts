@@ -7,6 +7,7 @@ import { E2EEncryption } from '../utils/e2e-encryption';
 import { CredentialManager, AWSCredentials } from '../utils/credential-manager';
 import { AnalyticsTracker } from '../analytics/analytics-tracker';
 import { PermissionManager } from '../utils/permission-manager';
+import { LocalLogParser } from '../utils/log-parser';
 
 export class DebugCopilot {
   public static currentPanel: DebugCopilot | undefined;
@@ -122,74 +123,13 @@ export class DebugCopilot {
    * Show welcome message with instructions
    */
   private async showWelcomeMessage() {
-    try {
-      // First, try to migrate credentials from workspace config (for upgrading users)
-      await this._credentialManager.migrateFromWorkspaceConfig();
-
-      // Check for stored credentials in SecretStorage
-      const storedCredentials = await this._credentialManager.getCredentials();
-
-      if (storedCredentials) {
-        console.log(`[Tivra DebugMind] Found stored credentials (type: ${storedCredentials.type})`);
-
-        // Auto-connect using stored credentials
-        if (storedCredentials.type === 'manual') {
-          this.addMessage({
-            type: 'system',
-            content: `🔄 Auto-connecting to AWS using saved credentials...`,
-            timestamp: new Date()
-          });
-
-          await this.connectToAWS(
-            storedCredentials.accessKeyId,
-            storedCredentials.secretAccessKey,
-            storedCredentials.region
-          );
-          return;
-        } else if (storedCredentials.type === 'sso') {
-          // TODO: Handle SSO auto-connect when SSO flow is implemented
-          console.log('[Tivra DebugMind] SSO credentials found, but SSO auto-connect not yet implemented');
-        }
-      }
-
-      // If no stored credentials, check server AWS connection status
-      const statusResponse = await axios.get(`${this._apiUrl}/api/aws/status`);
-      const isConnected = statusResponse.data?.connected || false;
-
-      if (isConnected) {
-        const region = statusResponse.data?.account?.region || 'unknown';
-
-        this.addMessage({
-          type: 'ai',
-          content: `**AWS Connected** ✅\n\nRegion: ${region}\n\nFetching AWS services...`,
-          timestamp: new Date()
-        });
-
-        // Fetch and display services - this will start the seamless flow
-        await this.fetchAWSServices(region);
-      } else {
-        this.addMessage({
-          type: 'ai',
-          content: `**Connect to AWS** 🔗\n\nI'll help you connect using your AWS Access Keys.`,
-          timestamp: new Date(),
-          suggestedPrompts: [
-            'Use Access Keys'
-            // 'Use SSO' // TODO: SSO flow - fix later
-          ]
-        });
-      }
-    } catch (error) {
-      // If status check fails, show generic welcome
-      this.addMessage({
-        type: 'ai',
-        content: `**Connect to AWS** 🔗\n\nI'll help you connect using your AWS Access Keys.`,
-        timestamp: new Date(),
-        suggestedPrompts: [
-          'Use Access Keys'
-          // 'Use SSO' // TODO: SSO flow - fix later
-        ]
-      });
-    }
+    // Show RCA-focused welcome message
+    this.addMessage({
+      type: 'ai',
+      content: `**Welcome to Tivra DebugMind** 🤖\n\n**Paste your error logs below to get instant RCA**\n\nI'll automatically:\n• Detect error patterns and exceptions\n• Scan your workspace for relevant files\n• Analyze root causes\n• Suggest fixes\n\n**Optional:** Connect to AWS for better experience with:\n• Real-time CloudWatch log fetching\n• Deployment history correlation\n• Auto-generated PRs\n\n*Just paste your error logs below to begin...*`,
+      timestamp: new Date(),
+      suggestedPrompts: ['Connect to AWS (Optional)']
+    });
   }
 
   public static createOrShow(extensionUri: vscode.Uri, context: vscode.ExtensionContext, apiUrl: string, credentialManager: CredentialManager, analytics?: AnalyticsTracker) {
@@ -898,6 +838,591 @@ export class DebugCopilot {
    * Trigger SRE Agent Investigation
    * Sends comprehensive context to the SRE agent for deep investigation
    */
+  /**
+   * NEW RCA FLOW: Handle pasted error logs and perform RCA analysis
+   */
+  private async handleRCAFlow(rawLogs: string) {
+    console.log('[Tivra DebugMind] Starting RCA flow for pasted logs');
+
+    // Step 1: Auto-detect patterns
+    this.addMessage({
+      type: 'system',
+      content: `🔍 **Auto-detecting patterns...**`,
+      timestamp: new Date()
+    });
+
+    let parsedLogs;
+    try {
+      const logParser = new LocalLogParser();
+      parsedLogs = logParser.parse(rawLogs);
+    } catch (error: any) {
+      console.error('[Tivra DebugMind] Log parsing failed:', error);
+      this.addMessage({
+        type: 'ai',
+        content: `❌ **Failed to Parse Logs**\n\nError: ${error.message}\n\nPlease ensure your logs:\n• Are properly formatted\n• Contain at least 5 lines\n• Include error messages (ERROR, FATAL, CRITICAL, SEVERE, Exception)\n\n*Try pasting your logs again.*`,
+        timestamp: new Date()
+      });
+      return;
+    }
+
+    // Step 2: Show detected patterns
+    if (parsedLogs.errors.length === 0) {
+      // No errors found by frontend parser, but backend can still analyze raw logs
+      console.log('[Tivra DebugMind] Frontend parser found no errors, proceeding with backend analysis');
+      this.addMessage({
+        type: 'ai',
+        content: `🔍 **Analyzing Logs...**\n\n**Detected Format:** ${parsedLogs.detectedFormat}\n**Total Lines:** ${parsedLogs.totalLines}\n\nFrontend pattern matching didn't find structured errors, but sending raw logs to backend for AI analysis...\n\n📡 Analyzing with Claude...`,
+        timestamp: new Date()
+      });
+    } else {
+      const errorSummary = parsedLogs.errors.map((err, idx) =>
+        `${idx + 1}. **${err.message}** (${err.count}x)`
+      ).join('\n');
+
+      this.addMessage({
+        type: 'ai',
+        content: `✅ **Pattern Detection Complete**\n\n**Detected Format:** ${parsedLogs.detectedFormat}\n**Total Lines:** ${parsedLogs.totalLines}\n**Errors Found:** ${parsedLogs.errors.length}\n\n**Error Summary:**\n${errorSummary}\n\n🔍 Scanning workspace for relevant files...`,
+        timestamp: new Date()
+      });
+    }
+
+    // Step 3: Workspace scan - Always scan workspace for code context
+    // Even if frontend parser found no errors, backend Claude might need code files
+    const workspaceContext = await this.scanWorkspaceForContext({ ...parsedLogs, rawLogs});
+
+    // Show workspace scan message
+    this.addMessage({
+      type: 'ai',
+      content: `✅ **Workspace Scan Complete**\n\nFound ${workspaceContext.files.length} relevant files\n\n📡 Sending to backend for RCA analysis...`,
+      timestamp: new Date()
+    });
+
+    // Step 4: Backend analysis
+    try {
+      const requestPayload = {
+        logs: rawLogs,
+        service_name: 'pasted-logs',
+        code_context: workspaceContext.files.length > 0 ? {
+          files: workspaceContext.files.map((f: any) => ({
+            file_path: f.path,
+            file_name: f.name,
+            line_number: f.lineNumber,
+            method: f.method,
+            class_name: f.className,
+            content: f.fullContent || f.snippet, // Send full content if available
+            language: this.detectLanguage(f.name)
+          })),
+          error_locations: workspaceContext.errorLocations || []
+        } : undefined
+      };
+
+      console.log('[Tivra DebugMind] ===== BACKEND REQUEST PAYLOAD =====');
+      console.log('[Tivra DebugMind] Logs length:', rawLogs.length);
+      console.log('[Tivra DebugMind] Logs preview:', rawLogs.substring(0, 200));
+      console.log('[Tivra DebugMind] Files count:', workspaceContext.files.length);
+      console.log('[Tivra DebugMind] Error locations count:', workspaceContext.errorLocations?.length || 0);
+      console.log('[Tivra DebugMind] Has code_context:', !!requestPayload.code_context);
+
+      if (requestPayload.code_context) {
+        console.log('[Tivra DebugMind] Code context files being sent:');
+        requestPayload.code_context.files.forEach((f: any, idx: number) => {
+          console.log(`[Tivra DebugMind]   ${idx + 1}. ${f.file_name} (${f.file_path}) - ${f.content?.length || 0} chars, language: ${f.language}`);
+        });
+      } else {
+        console.log('[Tivra DebugMind] ⚠️ WARNING: No code_context in request payload!');
+      }
+
+      console.log('[Tivra DebugMind] Endpoint:', `${this._apiUrl}/api/try-mode/analyze`);
+      console.log('[Tivra DebugMind] =====================================');
+
+      const response = await axios.post(
+        `${this._apiUrl}/api/try-mode/analyze`,
+        requestPayload,
+        {
+          timeout: 60000 // 60 second timeout
+        }
+      );
+
+      console.log('[Tivra DebugMind] RCA analysis completed:', {
+        confidence: response.data.confidence,
+        hasRootCause: !!response.data.root_cause,
+        evidenceCount: response.data.evidence?.length || 0,
+        hasFix: !!(response.data.suggested_fix || response.data.fix_code)
+      });
+
+      // Check if RCA confidence is too low (< 10%)
+      if (response.data.confidence < 0.1) {
+        console.warn('[Tivra DebugMind] Low confidence RCA result:', response.data);
+        this.addMessage({
+          type: 'ai',
+          content: `⚠️ **Unable to Perform RCA**\n\n${response.data.root_cause || 'Could not analyze the logs automatically.'}\n\n**Possible reasons:**\n• Logs may not contain enough error context\n• Log format may not be recognized\n• Error patterns are unclear\n\n**Please ensure your logs:**\n• Have clear error messages with ERROR/FATAL/EXCEPTION keywords\n• Include stack traces\n• Have timestamps and service names\n• Are from a recent error occurrence\n\n*Try pasting more complete error logs with stack traces.*`,
+          timestamp: new Date(),
+          suggestedPrompts: ['Paste More Logs']
+        });
+        return;
+      }
+
+      // Step 5: Display RCA results
+      await this.displayRCAResults(response.data);
+
+    } catch (error: any) {
+      console.error('[Tivra DebugMind] RCA analysis failed:', error);
+      console.error('[Tivra DebugMind] Error details:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message
+      });
+
+      let errorMsg = `❌ **RCA Analysis Failed**\n\n`;
+
+      if (error.response?.status === 400) {
+        const details = error.response.data?.details || error.response.data?.error;
+        errorMsg += `**Log Validation Error:**\n${details}\n\n`;
+        errorMsg += `**Please ensure your logs:**\n`;
+        errorMsg += `• Have timestamps\n`;
+        errorMsg += `• Contain ERROR, FATAL, CRITICAL, or EXCEPTION keywords\n`;
+        errorMsg += `• Include stack traces if available\n`;
+        errorMsg += `• Are properly formatted application logs\n`;
+      } else if (error.response?.status === 500) {
+        errorMsg += `Server error during analysis.\n\n`;
+        errorMsg += `Error: ${error.response.data?.error || 'Internal server error'}\n\n`;
+        errorMsg += `Please try again or contact support if the issue persists.`;
+      } else if (error.code === 'ECONNREFUSED') {
+        errorMsg += `Cannot connect to backend server.\n\n`;
+        errorMsg += `Please ensure the backend is running at: ${this._apiUrl}`;
+      } else {
+        errorMsg += `Error: ${error.response?.data?.error || error.message}\n\n`;
+        errorMsg += `Please try again or paste different logs.`;
+      }
+
+      this.addMessage({
+        type: 'ai',
+        content: errorMsg,
+        timestamp: new Date(),
+        suggestedPrompts: ['Paste More Logs']
+      });
+    }
+  }
+
+  /**
+   * Scan workspace for files relevant to the errors
+   */
+  private async scanWorkspaceForContext(parsedLogs: any): Promise<any> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders) {
+      return { files: [], errorTypes: [], errorLocations: [] };
+    }
+
+    const relevantFiles: any[] = [];
+    const errorTypes = parsedLogs.errors.map((err: any) => err.message);
+    const errorLocations: any[] = [];
+    const processedFiles = new Set<string>(); // Avoid duplicates
+
+    try {
+      // If no structured errors found, try to extract file paths directly from raw logs
+      if (parsedLogs.errors.length === 0 && parsedLogs.rawLogs) {
+        console.log('[Tivra DebugMind] No structured errors - extracting file paths from raw logs');
+        const filePathMatches = [
+          // Node.js/JavaScript stack traces: at ... (file:///path/to/file.js:568:16)
+          /\(file:\/\/\/.*\/([\w.-]+\.[jt]sx?):(\d+):(\d+)\)/g,
+          // Node.js/JavaScript stack traces: at ... (/path/to/file.js:123:45)
+          /\([^)]*\/([\w.-]+\.[jt]sx?):(\d+):(\d+)\)/g,
+          // Python stack traces: File "/path/to/file.py", line 123
+          /File\s+"[^"]*\/([\w.-]+\.py)",\s+line\s+(\d+)/g,
+          // Java stack traces: at com.example.Class.method(File.java:123)
+          /at\s+[\w.]+\(([\w.-]+\.java):(\d+)\)/g
+        ];
+
+        for (const regex of filePathMatches) {
+          let match;
+          while ((match = regex.exec(parsedLogs.rawLogs)) !== null) {
+            const fileName = match[1]; // Filename is always first capture group now
+            const lineNumber = parseInt(match[2] || '0', 10); // Line number is always second
+            const fileKey = `${fileName}:${lineNumber}`;
+
+            if (processedFiles.has(fileKey)) {
+              console.log(`[Tivra DebugMind] Skipping already processed file: ${fileKey}`);
+              continue;
+            }
+
+            console.log(`[Tivra DebugMind] Found file reference in raw logs: ${fileName}:${lineNumber}`);
+            console.log(`[Tivra DebugMind] Searching workspace for pattern: **/${fileName}`);
+
+            // Search for this file in workspace
+            const files = await vscode.workspace.findFiles(`**/${fileName}`, '**/node_modules/**', 5);
+
+            console.log(`[Tivra DebugMind] Workspace search returned ${files.length} file(s) for ${fileName}`);
+            if (files.length > 0) {
+              console.log(`[Tivra DebugMind] Found files: ${files.map(f => f.fsPath).join(', ')}`);
+            }
+
+            if (files.length > 0) {
+              for (const file of files) {
+                try {
+                  const content = await vscode.workspace.fs.readFile(file);
+                  const text = Buffer.from(content).toString('utf8');
+                  const fileSizeKB = content.byteLength / 1024;
+
+                  if (fileSizeKB > 1024) {
+                    console.log(`[Tivra DebugMind] Skipping large file: ${fileName} (${fileSizeKB.toFixed(2)}KB)`);
+                    continue;
+                  }
+
+                  console.log(`[Tivra DebugMind] Reading file from raw logs: ${fileName} (${fileSizeKB.toFixed(2)}KB)`);
+
+                  relevantFiles.push({
+                    path: file.fsPath,
+                    name: fileName,
+                    lineNumber: lineNumber || undefined,
+                    fullContent: text,
+                    snippet: lineNumber ? this.extractCodeSnippet(text, lineNumber) : undefined
+                  });
+
+                  if (lineNumber) {
+                    errorLocations.push({
+                      file: fileName,
+                      line: lineNumber,
+                      errorType: 'Stack trace entry'
+                    });
+                  }
+
+                  processedFiles.add(fileKey);
+                  break; // Only process first match
+                } catch (fileError) {
+                  console.error(`[Tivra DebugMind] Error reading file ${fileName}:`, fileError);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Use structured stack trace entries for more accurate file finding
+      for (const error of parsedLogs.errors) {
+        if (error.stackTraceEntries && error.stackTraceEntries.length > 0) {
+          console.log(`[Tivra DebugMind] Processing ${error.stackTraceEntries.length} stack trace entries`);
+
+          // Process each stack trace entry
+          for (const entry of error.stackTraceEntries) {
+            if (entry.file === 'unknown') {
+              continue;
+            }
+
+            const fileName = entry.file;
+            const fileKey = `${fileName}:${entry.line || 0}`;
+
+            // Skip if already processed
+            if (processedFiles.has(fileKey)) {
+              continue;
+            }
+
+            console.log(`[Tivra DebugMind] Searching for file: ${fileName}`);
+
+            // Search for this file in workspace
+            const files = await vscode.workspace.findFiles(`**/${fileName}`, '**/node_modules/**', 5);
+
+            if (files.length === 0) {
+              console.log(`[Tivra DebugMind] File not found: ${fileName}`);
+              continue;
+            }
+
+            for (const file of files) {
+              try {
+                const content = await vscode.workspace.fs.readFile(file);
+                const text = Buffer.from(content).toString('utf8');
+
+                // Check file size (skip files > 1MB to avoid overwhelming Claude)
+                const fileSizeKB = content.byteLength / 1024;
+                if (fileSizeKB > 1024) {
+                  console.log(`[Tivra DebugMind] Skipping large file: ${fileName} (${fileSizeKB.toFixed(2)}KB)`);
+                  continue;
+                }
+
+                console.log(`[Tivra DebugMind] Reading full file: ${fileName} (${fileSizeKB.toFixed(2)}KB)`);
+
+                relevantFiles.push({
+                  path: file.fsPath,
+                  name: fileName,
+                  lineNumber: entry.line,
+                  method: entry.method,
+                  className: entry.className,
+                  fullContent: text, // Send full file content instead of snippet
+                  snippet: entry.line ? this.extractCodeSnippet(text, entry.line) : undefined
+                });
+
+                // Track error location
+                if (entry.line) {
+                  errorLocations.push({
+                    file: fileName,
+                    line: entry.line,
+                    method: entry.method,
+                    className: entry.className,
+                    errorType: error.message
+                  });
+                }
+
+                processedFiles.add(fileKey);
+                break; // Only process first match to avoid duplicates
+              } catch (fileError) {
+                console.error(`[Tivra DebugMind] Error reading file ${fileName}:`, fileError);
+              }
+            }
+          }
+        }
+      }
+
+      console.log(`[Tivra DebugMind] ===== WORKSPACE SCAN SUMMARY =====`);
+      console.log(`[Tivra DebugMind] Found ${relevantFiles.length} relevant files`);
+      console.log(`[Tivra DebugMind] Tracked ${errorLocations.length} error locations`);
+
+      if (relevantFiles.length > 0) {
+        console.log(`[Tivra DebugMind] Files to send to backend:`);
+        relevantFiles.forEach((file, idx) => {
+          console.log(`[Tivra DebugMind]   ${idx + 1}. ${file.name} (${file.path}) - ${(file.fullContent?.length || 0)} chars`);
+        });
+      } else {
+        console.log(`[Tivra DebugMind] ⚠️ WARNING: No files found to send to backend!`);
+      }
+      console.log(`[Tivra DebugMind] ==================================`);
+
+      return {
+        files: relevantFiles,
+        errorTypes: errorTypes,
+        errorLocations: errorLocations,
+        workspaceRoot: workspaceFolders[0].uri.fsPath
+      };
+
+    } catch (error) {
+      console.error('[Tivra DebugMind] Workspace scan error:', error);
+      return { files: [], errorTypes: [], errorLocations: [] };
+    }
+  }
+
+  /**
+   * Detect programming language from file name
+   */
+  private detectLanguage(fileName: string): string {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    const langMap: Record<string, string> = {
+      'ts': 'typescript',
+      'tsx': 'typescript',
+      'js': 'javascript',
+      'jsx': 'javascript',
+      'py': 'python',
+      'java': 'java',
+      'go': 'go',
+      'rb': 'ruby',
+      'php': 'php',
+      'cs': 'csharp',
+      'cpp': 'cpp',
+      'c': 'c',
+      'rs': 'rust',
+      'kt': 'kotlin',
+      'swift': 'swift'
+    };
+    return langMap[ext || ''] || 'unknown';
+  }
+
+  /**
+   * Extract code snippet around a specific line number
+   */
+  private extractCodeSnippet(fileContent: string, lineNumber: number, contextLines: number = 5): string {
+    const lines = fileContent.split('\n');
+    const startLine = Math.max(0, lineNumber - contextLines - 1);
+    const endLine = Math.min(lines.length, lineNumber + contextLines);
+
+    return lines.slice(startLine, endLine)
+      .map((line, idx) => {
+        const actualLineNum = startLine + idx + 1;
+        const marker = actualLineNum === lineNumber ? '→' : ' ';
+        return `${marker} ${actualLineNum}: ${line}`;
+      })
+      .join('\n');
+  }
+
+  /**
+   * Display RCA analysis results
+   */
+  private async displayRCAResults(rcaData: any) {
+    // Build RCA results message
+    let resultsMsg = `✅ **Root Cause Analysis Complete**\n\n`;
+
+    // Handle both root_cause and rootCause (try-mode uses snake_case)
+    const rootCause = rcaData.root_cause || rcaData.rootCause;
+    if (rootCause) {
+      resultsMsg += `**🎯 Root Cause:**\n${rootCause}\n\n`;
+    }
+
+    // Show confidence if available
+    if (rcaData.confidence !== undefined) {
+      const confidencePercent = (rcaData.confidence * 100).toFixed(0);
+      resultsMsg += `**📊 Confidence:** ${confidencePercent}%\n\n`;
+    }
+
+    // Show pinpointed error locations if available
+    if (rcaData.error_locations && rcaData.error_locations.length > 0) {
+      resultsMsg += `**📍 Error Locations:**\n`;
+      rcaData.error_locations.forEach((loc: any, idx: number) => {
+        const locLine = `${idx + 1}. ${loc.file}:${loc.line}`;
+        const method = loc.method ? ` in method \`${loc.method}\`` : '';
+        const issue = loc.issue ? ` - ${loc.issue}` : '';
+        resultsMsg += `${locLine}${method}${issue}\n`;
+      });
+      resultsMsg += `\n`;
+    }
+
+    if (rcaData.evidence && rcaData.evidence.length > 0) {
+      resultsMsg += `**📋 Evidence:**\n`;
+      rcaData.evidence.forEach((item: string, idx: number) => {
+        resultsMsg += `${idx + 1}. ${item}\n`;
+      });
+      resultsMsg += `\n`;
+    }
+
+    // Handle both suggested_actions and recommendedActions
+    const actions = rcaData.suggested_actions || rcaData.recommendedActions || [];
+    if (actions.length > 0) {
+      resultsMsg += `**💡 Recommended Actions:**\n`;
+      actions.forEach((action: string, idx: number) => {
+        resultsMsg += `${idx + 1}. ${action}\n`;
+      });
+      resultsMsg += `\n`;
+    }
+
+    // Handle fix from try-mode format (suggested_fix, fix_code)
+    const fixContent = rcaData.suggested_fix || rcaData.fix_code || rcaData.fix;
+    if (fixContent) {
+      resultsMsg += `**🔧 Suggested Fix:**\n\`\`\`\n${fixContent}\n\`\`\`\n\n`;
+    }
+
+    // Store the fix for later application, normalize format
+    this._lastInvestigationResult = {
+      ...rcaData,
+      fix: fixContent,
+      rootCause: rootCause,
+      files: rcaData.fix_file ? [{ path: rcaData.fix_file }] : []
+    };
+
+    this.addMessage({
+      type: 'ai',
+      content: resultsMsg,
+      timestamp: new Date(),
+      suggestedPrompts: ['Connect to AWS for Better Experience', 'Paste More Logs']
+    });
+
+    // Track RCA completion
+    this._analytics?.trackFeatureUsage('rca', 'analysis_complete');
+  }
+
+  /**
+   * Apply fix from RCA analysis
+   */
+  private async applyRCAFix(fixData: any) {
+    console.log('[Tivra DebugMind] Applying RCA fix');
+
+    this.addMessage({
+      type: 'system',
+      content: `🔧 **Applying Fix...**`,
+      timestamp: new Date()
+    });
+
+    try {
+      // Parse fix data - it could be a string or structured object
+      let filePath: string | undefined;
+      let newCode: string;
+      let explanation: string | undefined;
+
+      if (typeof fixData === 'string') {
+        // If fix is just a code string, try to extract file info from RCA data
+        newCode = fixData;
+
+        // Try to infer file path from workspace context or ask user
+        const files = this._lastInvestigationResult?.files || [];
+        if (files.length === 1) {
+          filePath = files[0].path;
+        } else if (files.length > 1) {
+          // Ask user which file to apply to
+          interface FileChoice extends vscode.QuickPickItem {
+            path: string;
+          }
+
+          const fileChoices: FileChoice[] = files.map((f: any) => ({
+            label: f.name,
+            description: f.path,
+            path: f.path
+          }));
+
+          const choice = await vscode.window.showQuickPick(fileChoices, {
+            placeHolder: 'Select file to apply fix'
+          });
+
+          if (!choice) {
+            this.addMessage({
+              type: 'ai',
+              content: `Fix not applied. Please select a file to apply the fix.`,
+              timestamp: new Date(),
+              suggestedPrompts: ['Connect to AWS for Better Experience', 'Paste More Logs']
+            });
+            return;
+          }
+
+          filePath = choice.path;
+        } else {
+          // Ask user to specify file path
+          const input = await vscode.window.showInputBox({
+            prompt: 'Enter the file path to apply the fix',
+            placeHolder: 'src/main/java/com/example/Service.java'
+          });
+
+          if (!input) {
+            this.addMessage({
+              type: 'ai',
+              content: `Fix not applied. Please specify a file path.`,
+              timestamp: new Date(),
+              suggestedPrompts: ['Connect to AWS for Better Experience', 'Paste More Logs']
+            });
+            return;
+          }
+
+          filePath = input;
+        }
+
+        explanation = this._lastInvestigationResult?.rootCause || 'RCA fix applied';
+      } else if (fixData.filePath && fixData.code) {
+        // Structured fix object
+        filePath = fixData.filePath;
+        newCode = fixData.code;
+        explanation = fixData.explanation || 'RCA fix applied';
+      } else {
+        throw new Error('Invalid fix format');
+      }
+
+      if (!filePath) {
+        throw new Error('No file path specified for fix');
+      }
+
+      // Apply the fix using the existing applyFix method
+      await this.applyFix({
+        filePath: filePath as string,
+        newCode: newCode,
+        explanation: explanation || 'RCA fix applied'
+      });
+
+      // Track fix application
+      this._analytics?.trackFeatureUsage('rca', 'fix_applied');
+
+    } catch (error: any) {
+      console.error('[Tivra DebugMind] Failed to apply RCA fix:', error);
+      this.addMessage({
+        type: 'ai',
+        content: `❌ **Failed to Apply Fix**\n\nError: ${error.message}\n\nYou can try:\n• Manually applying the fix\n• Pasting more logs for re-analysis`,
+        timestamp: new Date(),
+        suggestedPrompts: ['Connect to AWS for Better Experience', 'Paste More Logs']
+      });
+    }
+  }
+
   private async triggerSREInvestigation() {
     console.log('[Tivra DebugMind] Triggering SRE Agent investigation');
 
@@ -1583,6 +2108,39 @@ export class DebugCopilot {
       content: text
     });
 
+    // NEW RCA FLOW: Check if user pasted error logs
+    const logParser = new LocalLogParser();
+    const validation = logParser.validate(text);
+
+    const textPreview = text.substring(0, 200).replace(/\n/g, ' ');
+    console.log('[Tivra DebugMind] Validating text:', textPreview);
+    console.log('[Tivra DebugMind] Text length:', text.length, 'lines:', text.split('\n').length);
+    console.log('[Tivra DebugMind] Log validation result:', validation);
+
+    if (validation.valid) {
+      // User pasted logs - trigger RCA flow
+      console.log('[Tivra DebugMind] Valid logs detected, triggering RCA flow');
+      await this.handleRCAFlow(text);
+      return;
+    } else if (validation.error) {
+      // User tried to paste logs but validation failed
+      // Show error if text looks like logs (multiple lines, timestamps, or log level keywords)
+      const lines = text.split('\n').filter(l => l.trim().length > 0);
+      const looksLikeLogs = lines.length >= 2 ||
+                           /\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}|INFO|WARN|DEBUG|TRACE|ERROR|FATAL|Exception|at\s+[\w.]+\(|File\s+"[^"]+"/i.test(text);
+
+      console.log('[Tivra DebugMind] Validation failed. Lines:', lines.length, 'Looks like logs:', looksLikeLogs, 'Error:', validation.error);
+
+      if (looksLikeLogs) {
+        this.addMessage({
+          type: 'ai',
+          content: `⚠️ **Log Validation Failed**\n\n${validation.error}\n\n**Requirements:**\n• At least 5 lines of logs\n• Must contain error keywords (ERROR, FATAL, CRITICAL, SEVERE, Exception)\n\n**Supported formats:**\n• Java/Spring Boot logs\n• Python logs\n• Node.js logs\n• CloudWatch logs\n\n**Example:**\n\`\`\`\n2025-01-15 10:30:45 ERROR [app] NullPointerException\n  at com.example.Service.method(Service.java:42)\n  ...\n\`\`\`\n\n*Please paste valid error logs with at least 5 lines.*`,
+          timestamp: new Date()
+        });
+        return;
+      }
+    }
+
     // Check if we're in AWS credential input flow
     if (this._awsConnectionState) {
       const handled = await this.handleAWSCredentialInput(text);
@@ -1590,6 +2148,33 @@ export class DebugCopilot {
     }
 
     const lowerText = text.toLowerCase();
+
+    // Handle terminal state prompts from fix application
+    if (lowerText.includes('create') && lowerText.includes('github') && lowerText.includes('pr')) {
+      this.showCreatePRInfo();
+      return;
+    }
+
+    if (lowerText.includes('monitor') && lowerText.includes('deployment')) {
+      this.showMonitorDeploymentInfo();
+      return;
+    }
+
+    if (lowerText.includes('save') && lowerText.includes('root cause')) {
+      this.showSaveRootCauseInfo();
+      return;
+    }
+
+    if (lowerText.includes('check') && lowerText.includes('similar') && lowerText.includes('issues')) {
+      this.showSimilarIssuesInfo();
+      return;
+    }
+
+    // NEW RCA FLOW: Check if user wants to apply the fix from RCA
+    if (lowerText === 'apply fix' && this._lastInvestigationResult?.fix) {
+      await this.applyRCAFix(this._lastInvestigationResult.fix);
+      return;
+    }
 
     // Check if user is providing log group for EC2
     if (lowerText.includes('provide log group')) {
@@ -1654,6 +2239,13 @@ export class DebugCopilot {
     if ((lowerText.includes('disconnect') || lowerText.includes('logout') || lowerText.includes('reset')) &&
         lowerText.includes('aws')) {
       await this.disconnectFromAWS();
+      return;
+    }
+
+    // Check if user wants to connect to AWS
+    if (lowerText.includes('connect') && lowerText.includes('aws')) {
+      // Start manual keys flow
+      this.startManualKeysFlow();
       return;
     }
 
@@ -1875,34 +2467,35 @@ export class DebugCopilot {
     //   return;
     // }
 
+    // DISABLED: AWS connection check - RCA flow doesn't require AWS connection
     // Before processing any other prompt, verify AWS connection
-    try {
-      const statusResponse = await axios.get(`${this._apiUrl}/api/aws/status`);
-      if (!statusResponse.data?.connected) {
-        this.addMessage({
-          type: 'ai',
-          content: `⚠️ **AWS Not Connected**\n\nTo analyze logs and debug AWS services, I need to connect to your AWS account first.\n\n**Connect to AWS** 🔗\n\nChoose your authentication method:`,
-          timestamp: new Date(),
-          suggestedPrompts: [
-            'Use Access Keys',
-            // 'Use SSO' // TODO: fix later
-            'Use Access Keys'
-          ]
-        });
-        return;
-      }
-    } catch (error) {
-      this.addMessage({
-        type: 'ai',
-        content: `⚠️ **Unable to verify AWS connection**\n\nI couldn't check your AWS connection status. Please make sure:\n\n1. Backend server is running\n2. You're connected to the internet\n\n**Connect to AWS** 🔗\n\nChoose your authentication method:`,
-        timestamp: new Date(),
-        suggestedPrompts: [
-          'Use Access Keys',
-          'Use SSO'
-        ]
-      });
-      return;
-    }
+    // try {
+    //   const statusResponse = await axios.get(`${this._apiUrl}/api/aws/status`);
+    //   if (!statusResponse.data?.connected) {
+    //     this.addMessage({
+    //       type: 'ai',
+    //       content: `⚠️ **AWS Not Connected**\n\nTo analyze logs and debug AWS services, I need to connect to your AWS account first.\n\n**Connect to AWS** 🔗\n\nChoose your authentication method:`,
+    //       timestamp: new Date(),
+    //       suggestedPrompts: [
+    //         'Use Access Keys',
+    //         // 'Use SSO' // TODO: fix later
+    //         'Use Access Keys'
+    //       ]
+    //     });
+    //     return;
+    //   }
+    // } catch (error) {
+    //   this.addMessage({
+    //     type: 'ai',
+    //     content: `⚠️ **Unable to verify AWS connection**\n\nI couldn't check your AWS connection status. Please make sure:\n\n1. Backend server is running\n2. You're connected to the internet\n\n**Connect to AWS** 🔗\n\nChoose your authentication method:`,
+    //     timestamp: new Date(),
+    //     suggestedPrompts: [
+    //       'Use Access Keys',
+    //       'Use SSO'
+    //     ]
+    //   });
+    //   return;
+    // }
 
     // Check if user clicked "Trigger Investigation" button
     if (lowerText === 'trigger investigation') {
@@ -1916,57 +2509,21 @@ export class DebugCopilot {
                              (lowerText.includes('error') || lowerText.includes('service') || lowerText.includes('log'));
 
     if (isAnalyzeRequest) {
-      // Automatically fetch logs and analyze
-      await this.analyzeAllServices();
+      // Guide user to paste logs for RCA
+      this.addMessage({
+        type: 'ai',
+        content: `To analyze errors, please **paste your error logs** in the chat.\n\nI can analyze:\n• Java/Spring Boot logs\n• Python logs\n• Node.js logs\n• CloudWatch logs\n• Any text-based error logs\n\n*Just paste your logs below and I'll automatically detect errors and perform RCA.*`,
+        timestamp: new Date()
+      });
       return;
     }
 
-    // Show AI is thinking
+    // If nothing matches, provide helpful RCA guidance
     this.addMessage({
       type: 'ai',
-      content: '',
-      timestamp: new Date(),
-      isTyping: true
+      content: `I'm here to help you debug! 🐛\n\n**To get started:**\nPaste your error logs below and I'll automatically:\n• Detect error patterns\n• Scan your workspace for relevant files\n• Perform root cause analysis\n• Suggest fixes\n\n*What error logs would you like me to analyze?*`,
+      timestamp: new Date()
     });
-
-    try {
-      // Send to AI with full context using the correct /api/chat endpoint
-      const aiResponse = await axios.post(`${this._apiUrl}/api/chat`, {
-        message: text,
-        context: {
-          ...this._conversationContext,
-          service: this._conversationContext.service, // Include full service context with logGroupName
-          connectedServices: this._conversationContext.service ? [this._conversationContext.service.name] : [],
-          // Include error analysis data if available
-          errorAnalysis: this._errorAnalysisData,
-          awsServices: this._awsServices
-        }
-      });
-
-      const { response, suggestedFix } = aiResponse.data;
-
-      // Update AI's response
-      this.updateLastMessage({
-        type: 'ai',
-        content: response,
-        timestamp: new Date(),
-        suggestedFix: suggestedFix
-      });
-
-      // Add to conversation history
-      this._conversationContext.conversationHistory.push({
-        role: 'assistant',
-        content: response
-      });
-
-    } catch (error: any) {
-      // Fallback to simple response
-      this.updateLastMessage({
-        type: 'ai',
-        content: this.generateFallbackResponse(text),
-        timestamp: new Date()
-      });
-    }
   }
 
   /**
@@ -2059,9 +2616,37 @@ export class DebugCopilot {
 
           this.addMessage({
             type: 'ai',
-            content: `Great! I've applied the fix. The changes should:\n\n${fix.explanation}\n\nWould you like me to:\n- Verify the fix works\n- Check for similar issues\n- Help with testing`,
+            content: `Great! I've applied the fix. The changes should:\n\n${fix.explanation}`,
             timestamp: new Date()
           });
+
+          // Add terminal state message with next steps
+          setTimeout(() => {
+            this.addMessage({
+              type: 'ai',
+              content: `## ✅ **Fix Applied - What's Next?**\n\n` +
+                `**Recommended Next Steps:**\n\n` +
+                `1️⃣ **Deploy & Monitor** - Push to production and watch CloudWatch\n` +
+                `2️⃣ **Create PR** - Document this fix for your team\n` +
+                `3️⃣ **Verify Impact** - Check if error rate decreased\n` +
+                `4️⃣ **Root Cause Learning** - Store this in the knowledge base\n\n` +
+                `**What I Can Help With:**\n` +
+                `• 📊 Monitor deployment for errors\n` +
+                `• 🎯 Create GitHub PR with this fix\n` +
+                `• 🔄 Set up auto-rollback if issues persist\n` +
+                `• 📝 Document root cause for future reference\n` +
+                `• 🤖 Similar issue detection across services\n\n` +
+                `**Or continue debugging** by pasting more logs!`,
+              timestamp: new Date(),
+              suggestedPrompts: [
+                'Create GitHub PR',
+                'Monitor Deployment',
+                'Save Root Cause',
+                'Check Similar Issues',
+                'Paste More Logs'
+              ]
+            });
+          }, 1500);
         }
       } else {
         this.addMessage({
@@ -2078,6 +2663,111 @@ export class DebugCopilot {
         timestamp: new Date()
       });
     }
+  }
+
+  private showCreatePRInfo() {
+    this.addMessage({
+      type: 'ai',
+      content: `## 🎯 **Create GitHub PR with Fix**\n\n` +
+        `I can help you create a GitHub Pull Request with:\n\n` +
+        `✅ **Automatic PR Creation**:\n` +
+        `• Commit the fix with detailed message\n` +
+        `• Push to a new branch\n` +
+        `• Create PR with RCA summary\n` +
+        `• Include root cause analysis\n` +
+        `• Add before/after comparison\n\n` +
+        `✅ **PR Description Includes**:\n` +
+        `• Error description and impact\n` +
+        `• Root cause identified\n` +
+        `• Fix explanation\n` +
+        `• Testing recommendations\n` +
+        `• Deployment notes\n\n` +
+        `**To create a PR**, make sure:\n` +
+        `1. Git repository is initialized\n` +
+        `2. GitHub credentials are configured\n` +
+        `3. You have push permissions\n\n` +
+        `Then just ask: "Create PR for this fix"`,
+      timestamp: new Date(),
+      suggestedPrompts: ['Monitor Deployment', 'Paste More Logs']
+    });
+  }
+
+  private showMonitorDeploymentInfo() {
+    this.addMessage({
+      type: 'ai',
+      content: `## 📊 **Monitor Deployment**\n\n` +
+        `After deploying your fix, I can help you monitor it:\n\n` +
+        `✅ **Real-Time Monitoring**:\n` +
+        `• Watch CloudWatch logs for the error pattern\n` +
+        `• Track error rate changes\n` +
+        `• Alert if issues persist\n` +
+        `• Compare pre/post deployment metrics\n\n` +
+        `✅ **Auto-Rollback**:\n` +
+        `• Detect if error rate increases\n` +
+        `• Automatically trigger rollback\n` +
+        `• Notify team of rollback\n\n` +
+        `✅ **Success Verification**:\n` +
+        `• Confirm error stopped occurring\n` +
+        `• Validate service health\n` +
+        `• Generate success report\n\n` +
+        `**To start monitoring**, deploy your fix and ask:\n` +
+        `"Monitor deployment for [service-name]"`,
+      timestamp: new Date(),
+      suggestedPrompts: ['Create GitHub PR', 'Paste More Logs']
+    });
+  }
+
+  private showSaveRootCauseInfo() {
+    this.addMessage({
+      type: 'ai',
+      content: `## 💾 **Save Root Cause to Knowledge Base**\n\n` +
+        `Store this root cause analysis for future reference:\n\n` +
+        `✅ **What Gets Saved**:\n` +
+        `• Error pattern and symptoms\n` +
+        `• Root cause analysis\n` +
+        `• Fix that was applied\n` +
+        `• Code context\n` +
+        `• Deployment info\n\n` +
+        `✅ **Benefits**:\n` +
+        `• **Faster future debugging** - Similar errors auto-detected\n` +
+        `• **Team learning** - Share knowledge across engineers\n` +
+        `• **Pattern detection** - Identify recurring issues\n` +
+        `• **Automated suggestions** - Get fix recommendations\n\n` +
+        `✅ **Powered by Pinecone**:\n` +
+        `• Vector database for semantic search\n` +
+        `• Find similar issues even with different wording\n` +
+        `• Learn from past incidents\n\n` +
+        `**To save**, just ask:\n` +
+        `"Save this root cause to knowledge base"`,
+      timestamp: new Date(),
+      suggestedPrompts: ['Check Similar Issues', 'Paste More Logs']
+    });
+  }
+
+  private showSimilarIssuesInfo() {
+    this.addMessage({
+      type: 'ai',
+      content: `## 🤖 **Check for Similar Issues**\n\n` +
+        `I can search for similar issues across your services:\n\n` +
+        `✅ **Cross-Service Analysis**:\n` +
+        `• Scan all AWS services\n` +
+        `• Detect same error pattern\n` +
+        `• Identify affected services\n` +
+        `• Bulk fix recommendations\n\n` +
+        `✅ **Pattern Matching**:\n` +
+        `• Same root cause\n` +
+        `• Similar code patterns\n` +
+        `• Related deployment issues\n` +
+        `• Dependency conflicts\n\n` +
+        `✅ **Proactive Prevention**:\n` +
+        `• Fix issues before they cause outages\n` +
+        `• Apply learnings across codebase\n` +
+        `• Prevent cascading failures\n\n` +
+        `**To check**, ask:\n` +
+        `"Check for similar issues across services"`,
+      timestamp: new Date(),
+      suggestedPrompts: ['Save Root Cause', 'Paste More Logs']
+    });
   }
 
   /**
@@ -2308,6 +2998,7 @@ export class DebugCopilot {
       border-top: 1px solid var(--vscode-panel-border);
       display: flex;
       gap: 10px;
+      align-items: flex-end;
     }
 
     #messageInput {
@@ -2316,9 +3007,12 @@ export class DebugCopilot {
       background-color: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       border: 1px solid var(--vscode-input-border);
-      border-radius: 24px;
+      border-radius: 12px;
       font-family: var(--vscode-font-family);
       font-size: 14px;
+      resize: vertical;
+      min-height: 60px;
+      max-height: 300px;
     }
 
     #sendButton {
@@ -2347,12 +3041,12 @@ export class DebugCopilot {
   <div class="messages" id="messages"></div>
 
   <div class="input-container">
-    <input
-      type="text"
+    <textarea
       id="messageInput"
-      placeholder="Ask me about your errors..."
+      placeholder="Paste your error logs here or ask me a question..."
       autocomplete="off"
-    />
+      rows="3"
+    ></textarea>
     <button id="sendButton">Send</button>
   </div>
 
@@ -2389,17 +3083,6 @@ export class DebugCopilot {
           html += \`<div class="typing-indicator"><span></span><span></span><span></span></div>\`;
         } else {
           html += \`<div class="message-content">\${formatContent(msg.content)}</div>\`;
-
-          if (msg.suggestedFix) {
-            html += \`<div class="fix-actions">
-              <button class="fix-button" onclick='applyFix(\${JSON.stringify(msg.suggestedFix).replace(/'/g, "&apos;")})'>
-                ✨ Apply Fix
-              </button>
-              <button class="fix-button secondary" onclick="rejectFix()">
-                Not Now
-              </button>
-            </div>\`;
-          }
 
           if (msg.suggestedPrompts && msg.suggestedPrompts.length > 0) {
             html += \`<div class="suggested-prompts">\`;
@@ -2452,8 +3135,13 @@ export class DebugCopilot {
     }
 
     sendButton.addEventListener('click', sendMessage);
-    messageInput.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') sendMessage();
+    messageInput.addEventListener('keydown', (e) => {
+      // Enter without Shift sends the message
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+      // Shift+Enter allows new line (default textarea behavior)
     });
   </script>
 </body>
