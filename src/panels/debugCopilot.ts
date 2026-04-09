@@ -8,6 +8,7 @@ import { CredentialManager, AWSCredentials } from '../utils/credential-manager';
 import { AnalyticsTracker } from '../analytics/analytics-tracker';
 import { PermissionManager } from '../utils/permission-manager';
 import { LocalLogParser } from '../utils/log-parser';
+import { RCAFeedbackHandler } from './rcaFeedback';
 
 export class DebugCopilot {
   public static currentPanel: DebugCopilot | undefined;
@@ -63,6 +64,9 @@ export class DebugCopilot {
   // Pending feedback session ID (for post-validation feedback)
   private _pendingFeedbackSessionId: string | null = null;
 
+  // RCA feedback handler (decoupled to rcaFeedback.ts)
+  private _feedbackHandler!: RCAFeedbackHandler;
+
   private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, context: vscode.ExtensionContext, apiUrl: string, credentialManager: CredentialManager, analytics?: AnalyticsTracker) {
     this._panel = panel;
     this._context = context;
@@ -70,6 +74,7 @@ export class DebugCopilot {
     this._credentialManager = credentialManager;
     this._analytics = analytics;
     this._permissionManager = new PermissionManager(apiUrl);
+    this._feedbackHandler = new RCAFeedbackHandler(apiUrl, this.addMessage.bind(this), analytics);
 
     // Restore GitHub OAuth data from globalState (persists across reloads)
     this._githubData = this._context.globalState.get('tivra_github_data') || null;
@@ -106,6 +111,16 @@ export class DebugCopilot {
             break;
           case 'rejectFix':
             this.handleFixRejection(message.reason);
+            break;
+          case 'rcaFeedback':
+            // Mark the feedback card as submitted so renderMessages won't re-render the buttons
+            const feedbackMsg = this._messages.find(
+              m => m.feedbackCard?.sessionId === message.sessionId
+            );
+            if (feedbackMsg?.feedbackCard) {
+              feedbackMsg.feedbackCard.submitted = true;
+            }
+            this._feedbackHandler.submitFeedback(message.sessionId, message.helpful, message.correction);
             break;
         }
       },
@@ -959,6 +974,17 @@ export class DebugCopilot {
           timestamp: new Date(),
           suggestedPrompts: ['Paste More Logs']
         });
+        const lowConfSessionId = response.data.session_id;
+        if (lowConfSessionId) {
+          setTimeout(() => {
+            this.addMessage({
+              type: 'ai',
+              content: '',
+              timestamp: new Date(),
+              feedbackCard: { sessionId: lowConfSessionId }
+            });
+          }, 1000);
+        }
         return;
       }
 
@@ -1310,6 +1336,19 @@ export class DebugCopilot {
       timestamp: new Date(),
       suggestedPrompts: ['Connect to AWS for Better Experience', 'Paste More Logs']
     });
+
+    // Show feedback card after RCA results — ask if the analysis was accurate
+    const sessionId = rcaData.session_id;
+    if (sessionId) {
+      setTimeout(() => {
+        this.addMessage({
+          type: 'ai',
+          content: '',
+          timestamp: new Date(),
+          feedbackCard: { sessionId }
+        });
+      }, 1000);
+    }
 
     // Track RCA completion
     this._analytics?.trackFeatureUsage('rca', 'analysis_complete');
@@ -3027,6 +3066,19 @@ export class DebugCopilot {
     }
 
     #sendButton:hover { opacity: 0.9; }
+    .feedback-card { margin-top:12px; padding:12px 14px; background:rgba(30,144,255,0.07); border:1px solid rgba(30,144,255,0.22); border-radius:8px; }
+    .feedback-question { margin:0 0 10px; font-size:13px; opacity:0.88; }
+    .feedback-done { margin:0; font-size:13px; opacity:0.88; }
+    .feedback-buttons { display:flex; gap:8px; flex-wrap:wrap; }
+    .feedback-btn { padding:5px 13px; border-radius:6px; border:1px solid rgba(255,255,255,0.18); cursor:pointer; font-size:13px; background:transparent; color:var(--vscode-foreground); transition:opacity 0.15s; }
+    .feedback-btn.yes { border-color:rgba(0,200,100,0.45); color:#00c864; }
+    .feedback-btn.no  { border-color:rgba(255,80,80,0.45); color:#ff5050; }
+    .feedback-btn:disabled { opacity:0.4; cursor:default; }
+    .feedback-btn:hover:not(:disabled) { opacity:0.75; }
+    .correction-area { margin-top:10px; }
+    .correction-area textarea { width:100%; min-height:64px; padding:8px; background:var(--vscode-input-background); color:var(--vscode-input-foreground); border:1px solid var(--vscode-input-border); border-radius:6px; font-family:var(--vscode-font-family); font-size:13px; box-sizing:border-box; resize:vertical; }
+    .correction-submit { margin-top:6px; padding:5px 13px; background:rgba(30,144,255,0.25); border:1px solid rgba(30,144,255,0.45); border-radius:6px; color:var(--vscode-foreground); cursor:pointer; font-size:13px; }
+    .correction-submit:hover { opacity:0.8; }
   </style>
 </head>
 <body>
@@ -3082,7 +3134,7 @@ export class DebugCopilot {
         if (msg.isTyping) {
           html += \`<div class="typing-indicator"><span></span><span></span><span></span></div>\`;
         } else {
-          html += \`<div class="message-content">\${formatContent(msg.content)}</div>\`;
+          if (msg.content) { html += \`<div class="message-content">\${formatContent(msg.content)}</div>\`; }
 
           if (msg.suggestedPrompts && msg.suggestedPrompts.length > 0) {
             html += \`<div class="suggested-prompts">\`;
@@ -3091,6 +3143,21 @@ export class DebugCopilot {
               html += \`<button class="prompt-button" onclick='sendPrompt("\${escapedPrompt}")'>\${prompt}</button>\`;
             });
             html += \`</div>\`;
+          }
+
+          if (msg.feedbackCard && !msg.feedbackCard.submitted) {
+            var sid = msg.feedbackCard.sessionId;
+            html += '<div class="feedback-card">' +
+              '<p class="feedback-question">Was this root cause analysis accurate? Your feedback trains our AI.</p>' +
+              '<div class="feedback-buttons">' +
+                '<button class="feedback-btn yes" data-session="' + sid + '" data-helpful="true" onclick="onFeedback(this)">✅ Yes, it worked!</button>' +
+                '<button class="feedback-btn no" data-session="' + sid + '" data-helpful="false" onclick="onFeedback(this)">❌ No, it didn&#39;t work</button>' +
+              '</div>' +
+              '<div class="correction-area" id="correction-' + sid + '" style="display:none">' +
+                '<textarea id="correction-text-' + sid + '" placeholder="What was the actual root cause or correct fix? (optional)"></textarea>' +
+                '<button class="correction-submit" data-session="' + sid + '" onclick="submitCorrection(this)">Submit Correction</button>' +
+              '</div>' +
+            '</div>';
           }
         }
 
@@ -3132,6 +3199,27 @@ export class DebugCopilot {
     function sendPrompt(prompt) {
       messageInput.value = prompt;
       sendMessage();
+    }
+
+    function onFeedback(btn) {
+      var sid = btn.dataset.session;
+      var helpful = btn.dataset.helpful === 'true';
+      if (helpful) {
+        vscode.postMessage({ type: 'rcaFeedback', sessionId: sid, helpful: true });
+        btn.closest('.feedback-card').innerHTML = '<p class="feedback-done">Thanks! Feedback recorded.</p>';
+      } else {
+        var area = document.getElementById('correction-' + sid);
+        if (area) { area.style.display = 'block'; }
+        btn.closest('.feedback-buttons').querySelectorAll('.feedback-btn').forEach(function(b) { b.disabled = true; });
+      }
+    }
+
+    function submitCorrection(btn) {
+      var sid = btn.dataset.session;
+      var textarea = document.getElementById('correction-text-' + sid);
+      var correction = textarea ? textarea.value.trim() : '';
+      vscode.postMessage({ type: 'rcaFeedback', sessionId: sid, helpful: false, correction: correction });
+      btn.closest('.feedback-card').innerHTML = '<p class="feedback-done">Correction noted! This helps improve our model.</p>';
     }
 
     sendButton.addEventListener('click', sendMessage);
@@ -4200,6 +4288,7 @@ interface ChatMessage {
   suggestedFix?: CodeFix;
   suggestedPrompts?: string[];
   isTyping?: boolean;
+  feedbackCard?: { sessionId: string; submitted?: boolean };
 }
 
 interface CodeFix {
